@@ -45,6 +45,10 @@ extern BOOLEAN g_IsDebuggeeInHandshakingPhase;
 extern BOOLEAN g_ShouldPreviousCommandBeContinued;
 extern BYTE    g_EndOfBufferCheckSerial[4];
 extern ULONG   g_CurrentRemoteCore;
+extern UINT64  g_KernelBaseAddress;
+
+extern PMODULE_SYMBOL_DETAIL g_SymbolTable;
+extern UINT32                g_SymbolTableSize;
 
 /**
  * @brief compares the buffer with a string
@@ -2650,6 +2654,151 @@ KdPrepareSerialConnectionToRemoteSystem(HANDLE  SerialHandle,
 }
 
 /**
+ * @brief Wait for a kernel response, at most TimeoutMilliseconds
+ *
+ * @param KernelSyncObjectId
+ * @param TimeoutMilliseconds
+ *
+ * @return BOOLEAN TRUE if the response arrived in time
+ */
+static BOOLEAN
+KdWaitForKernelResponseWithTimeout(UINT32 KernelSyncObjectId, DWORD TimeoutMilliseconds)
+{
+    DEBUGGER_SYNCRONIZATION_EVENTS_STATE * SyncronizationObject =
+        &g_KernelSyncronizationObjectsHandleTable[KernelSyncObjectId];
+
+    SyncronizationObject->IsOnWaitingState = TRUE;
+
+    if (PlatformWaitForSingleObject(SyncronizationObject->EventHandle, TimeoutMilliseconds) == WAIT_OBJECT_0)
+    {
+        return TRUE;
+    }
+
+    SyncronizationObject->IsOnWaitingState = FALSE;
+    return FALSE;
+}
+
+/**
+ * @brief Recover the debuggee's kernel base from the module list of the symbol table
+ * @details The base normally arrives in the 'started' packet, which a reattach never sees
+ *
+ * @return VOID
+ */
+static VOID
+KdUpdateKernelBaseFromSymbolTable()
+{
+    if (g_SymbolTable == NULL)
+    {
+        return;
+    }
+
+    for (SIZE_T i = 0; i < g_SymbolTableSize / sizeof(MODULE_SYMBOL_DETAIL); i++)
+    {
+        const CHAR * Name = strrchr(g_SymbolTable[i].FilePath, '\\');
+        Name              = Name == NULL ? g_SymbolTable[i].FilePath : Name + 1;
+
+        if (PlatformStrCaseCmp(Name, "ntoskrnl.exe") == 0 || PlatformStrCaseCmp(Name, "ntkrnlmp.exe") == 0)
+        {
+            g_KernelBaseAddress = g_SymbolTable[i].BaseAddress;
+            return;
+        }
+    }
+}
+
+/**
+ * @brief Take over a debuggee that is already prepared (this is debugger)
+ * @details A debuggee sends its handshake only once per '.debug prepare' and keeps
+ * serving that session even after its debugger is gone (a serial link has no
+ * disconnect), so a new debugger would wait for the handshake forever. Instead,
+ * pause the debuggee through the listener that its user-mode side keeps running,
+ * which works whether the old debugger left it running or halted
+ *
+ * @param SerialHandle
+ * @param IsNamedPipe
+ * @param PauseAfterConnection
+ *
+ * @return BOOLEAN
+ */
+BOOLEAN
+KdReattachSerialConnectionToRemoteSystem(HANDLE  SerialHandle,
+                                         BOOLEAN IsNamedPipe,
+                                         BOOLEAN PauseAfterConnection)
+{
+    ShowMessages("reattaching to the debuggee...\n");
+
+    //
+    // Initialize the handle table
+    //
+    for (SIZE_T i = 0; i < DEBUGGER_MAXIMUM_SYNCRONIZATION_KERNEL_DEBUGGER_OBJECTS; i++)
+    {
+        g_KernelSyncronizationObjectsHandleTable[i].IsOnWaitingState = FALSE;
+        g_KernelSyncronizationObjectsHandleTable[i].EventHandle =
+            PlatformCreateEvent(FALSE, FALSE);
+    }
+
+    //
+    // The session already exists on the debuggee side, so we are connected now
+    //
+    g_SerialConnectionAlreadyClosed     = FALSE;
+    g_SerialRemoteComPortHandle         = SerialHandle;
+    g_IsDebuggerConntectedToNamedPipe   = IsNamedPipe;
+    g_IsSerialConnectedToRemoteDebuggee = TRUE;
+    g_IsDebuggeeRunning                 = TRUE;
+
+    g_SerialListeningThreadHandle =
+        PlatformCreateThread(ListeningSerialPauseDebuggerThread, NULL);
+
+    //
+    // Pause it from its user-mode listener and wait for its state
+    //
+    if (!KdCommandPacketToDebuggee(DEBUGGER_REMOTE_PACKET_TYPE_DEBUGGER_TO_DEBUGGEE_EXECUTE_ON_USER_MODE,
+                                   DEBUGGER_REMOTE_PACKET_REQUESTED_ACTION_ON_USER_MODE_PAUSE) ||
+        !KdWaitForKernelResponseWithTimeout(DEBUGGER_SYNCRONIZATION_OBJECT_KERNEL_DEBUGGER_PAUSED_DEBUGGEE_DETAILS,
+                                            3000))
+    {
+        //
+        // No answer: the old debugger left it halted, and a halted debuggee only
+        // reads VMX-root packets. Resume it, then pause it the same way
+        //
+        KdCommandPacketToDebuggee(DEBUGGER_REMOTE_PACKET_TYPE_DEBUGGER_TO_DEBUGGEE_EXECUTE_ON_VMX_ROOT,
+                                  DEBUGGER_REMOTE_PACKET_REQUESTED_ACTION_ON_VMX_ROOT_MODE_CONTINUE);
+        PlatformSleep(500);
+
+        if (!KdCommandPacketToDebuggee(DEBUGGER_REMOTE_PACKET_TYPE_DEBUGGER_TO_DEBUGGEE_EXECUTE_ON_USER_MODE,
+                                       DEBUGGER_REMOTE_PACKET_REQUESTED_ACTION_ON_USER_MODE_PAUSE) ||
+            !KdWaitForKernelResponseWithTimeout(DEBUGGER_SYNCRONIZATION_OBJECT_KERNEL_DEBUGGER_PAUSED_DEBUGGEE_DETAILS,
+                                                10000))
+        {
+            ShowMessages("err, the debuggee did not respond; is it prepared ('.debug prepare') "
+                         "and connected to this port?\n");
+            KdUninitializeConnection();
+            return FALSE;
+        }
+    }
+
+    //
+    // The symbol details (and the kernel base) normally come with the handshake
+    //
+    ShowMessages("getting symbol details...\n");
+    if (SymbolReloadSymbolTableInDebuggerMode(0))
+    {
+        KdUpdateKernelBaseFromSymbolTable();
+    }
+
+    ShowMessages("reattached to the debuggee\n");
+
+    if (!PauseAfterConnection)
+    {
+        //
+        // Same as a regular connection without 'pause': continue and wait on this thread
+        //
+        KdBreakControlCheckAndContinueDebugger();
+    }
+
+    return TRUE;
+}
+
+/**
  * @brief Check and handshake to make sure if the remote debugger is listening
  *
  * @param ComPortHandle
@@ -2814,6 +2963,7 @@ KdCloseSerialHandle(HANDLE Handle)
  * @param IsPreparing
  * @param IsNamedPipe
  * @param PauseAfterConnection
+ * @param IsReattach take over a debuggee that already finished its handshake
  *
  * @return BOOLEAN
  */
@@ -2823,7 +2973,8 @@ KdPrepareAndConnectDebugPort(const CHAR * PortName,
                              UINT32       Port,
                              BOOLEAN      IsPreparing,
                              BOOLEAN      IsNamedPipe,
-                             BOOLEAN      PauseAfterConnection)
+                             BOOLEAN      PauseAfterConnection,
+                             BOOLEAN      IsReattach)
 {
     HANDLE Comm; /* Handle to the Serial port */
 #ifdef _WIN32
@@ -2841,6 +2992,12 @@ KdPrepareAndConnectDebugPort(const CHAR * PortName,
     //
     if (IsConnectedToAnyInstanceOfDebuggerOrDebuggee())
     {
+        return FALSE;
+    }
+
+    if (IsPreparing && IsReattach)
+    {
+        ShowMessages("err, only a debugger can reattach to a debuggee\n");
         return FALSE;
     }
 
@@ -3259,8 +3416,13 @@ KdPrepareAndConnectDebugPort(const CHAR * PortName,
 
         //
         // If we are here, then it's a debugger (not debuggee)
-        // let's prepare the debuggee
+        // let's prepare the debuggee, or take over one that is already prepared
         //
+        if (IsReattach)
+        {
+            return KdReattachSerialConnectionToRemoteSystem(Comm, IsNamedPipe, PauseAfterConnection);
+        }
+
         KdPrepareSerialConnectionToRemoteSystem(Comm, IsNamedPipe, PauseAfterConnection);
     }
 
