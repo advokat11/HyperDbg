@@ -1262,11 +1262,16 @@ UdSendStepPacketToDebuggee(UINT64                           ProcessDetailToken,
     //
     // Check for specific stepping type
     //
-    if (StepType == DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER)
+    if (StepType == DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER ||
+        StepType == DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER_FOR_GU)
     {
         //
         // We should check whether the current instruction is a 'call'
         // instruction or not, if yes we have to compute the length of call
+        //
+        // 'gu' (step out) needs it as well: like the kernel-level stepper, it
+        // steps over calls instead of into them. The last-instruction variant
+        // is a 'ret', not a 'call', so it needs no call length.
         //
         if (HyperDbgCheckWhetherTheCurrentInstructionIsCall(
                 (UCHAR *)&g_ActiveProcessDebuggingState.InstructionBytesOnRip[0],

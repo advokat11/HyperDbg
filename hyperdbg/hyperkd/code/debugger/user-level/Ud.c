@@ -322,6 +322,16 @@ UdStepInstructions(PROCESSOR_DEBUGGING_STATE *         DbgState,
 
     case DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER:
 
+    //
+    // Step-over for 'gu' (step out) is the same step; the CLI loops over it
+    // until it sees a 'ret'. Without these two cases it fell into 'default',
+    // so nothing was stepped and the thread stayed paused: the debugger then
+    // waited for a 'debuggee is running' event that never came ('gu' hung
+    // forever, and with it the session).
+    //
+    case DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER_FOR_GU:
+    case DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER_FOR_GU_LAST_INSTRUCTION:
+
         //
         // Apply Step-over (p command)
         //
