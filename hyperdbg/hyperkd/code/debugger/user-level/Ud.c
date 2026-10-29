@@ -353,6 +353,37 @@ UdStepInstructions(PROCESSOR_DEBUGGING_STATE *         DbgState,
 }
 
 /**
+ * @brief Take the buffer of the command the IOCTL thread is waiting for
+ * @details the IOCTL thread withdraws the buffer when it gives up waiting (its
+ * IRP may be gone then), and a command left in another slot of the paused
+ * thread may find the buffer of a newer request, so a command runs only on a
+ * buffer it takes here and that is of its own type
+ *
+ * @param ActionType
+ *
+ * @return PDEBUGGER_UD_COMMAND_PACKET NULL if there is no buffer for this command
+ */
+static PDEBUGGER_UD_COMMAND_PACKET
+UdTakeWaitingCommandBuffer(DEBUGGER_UD_COMMAND_ACTION_TYPE ActionType)
+{
+    PDEBUGGER_UD_COMMAND_PACKET ActionRequest;
+
+    ActionRequest = (PDEBUGGER_UD_COMMAND_PACKET)CpuInterlockedExchange64((INT64 volatile *)&g_UserDebuggerWaitingCommandBuffer, 0);
+
+    if (ActionRequest != NULL && ActionRequest->UdAction.ActionType != ActionType)
+    {
+        //
+        // Not ours: give it back to the command it belongs to
+        //
+        CpuInterlockedCompareExchange64((INT64 volatile *)&g_UserDebuggerWaitingCommandBuffer, (INT64)ActionRequest, 0);
+
+        return NULL;
+    }
+
+    return ActionRequest;
+}
+
+/**
  * @brief Perform reading register(s) in the target thread
  *
  * @param DbgState The state of the debugger on the current core
@@ -372,8 +403,14 @@ UdReadRegisters(PROCESSOR_DEBUGGING_STATE * DbgState,
     //
     // Recover the action request buffer and optional storage buffer
     //
-    ActionRequest = (DEBUGGER_UD_COMMAND_PACKET *)g_UserDebuggerWaitingCommandBuffer;
-    RegDesc       = (PDEBUGGEE_REGISTER_READ_DESCRIPTION)((UINT8 *)g_UserDebuggerWaitingCommandBuffer + sizeof(DEBUGGER_UD_COMMAND_PACKET));
+    ActionRequest = UdTakeWaitingCommandBuffer(DEBUGGER_UD_COMMAND_ACTION_TYPE_READ_REGISTERS);
+
+    if (ActionRequest == NULL)
+    {
+        return;
+    }
+
+    RegDesc = (PDEBUGGEE_REGISTER_READ_DESCRIPTION)((UINT8 *)ActionRequest + sizeof(DEBUGGER_UD_COMMAND_PACKET));
 
     //
     // *** Here, we should read the registers and put them in the optional storage buffer ***
@@ -414,8 +451,14 @@ UdRunScript(PROCESSOR_DEBUGGING_STATE * DbgState)
     //
     // Recover the action request buffer and optional storage buffer
     //
-    ActionRequest = (DEBUGGER_UD_COMMAND_PACKET *)g_UserDebuggerWaitingCommandBuffer;
-    ScriptPacket  = (DEBUGGEE_SCRIPT_PACKET *)((UINT8 *)g_UserDebuggerWaitingCommandBuffer + sizeof(DEBUGGER_UD_COMMAND_PACKET));
+    ActionRequest = UdTakeWaitingCommandBuffer(DEBUGGER_UD_COMMAND_ACTION_TYPE_EXECUTE_SCRIPT_BUFFER);
+
+    if (ActionRequest == NULL)
+    {
+        return;
+    }
+
+    ScriptPacket = (DEBUGGEE_SCRIPT_PACKET *)((UINT8 *)ActionRequest + sizeof(DEBUGGER_UD_COMMAND_PACKET));
 
     //
     // *** Here, we should execute script buffer and put them in the optional storage buffer ***
@@ -652,6 +695,8 @@ UdDispatchUsermodeCommands(PDEBUGGER_UD_COMMAND_PACKET ActionRequest,
 {
     PUSERMODE_DEBUGGING_PROCESS_DETAILS ProcessDebuggingDetails;
     BOOLEAN                             Result;
+    LARGE_INTEGER                       WaitStart;
+    LARGE_INTEGER                       Now;
 
     //
     // Find the thread debugging detail of the thread
@@ -711,10 +756,33 @@ UdDispatchUsermodeCommands(PDEBUGGER_UD_COMMAND_PACKET ActionRequest,
         // DISPATCH_LEVEL and faults copying the result to the user buffer
         // (bugcheck 0x50)
         //
+        // The thread may also never run it (it exits, or is resumed). This wait
+        // can't be interrupted, so it is bounded: past the timeout, the command
+        // is withdrawn unless the paused thread has already taken it, in which
+        // case it is running and about to complete
+        //
+        PlatformTimeQuerySystemTime(&WaitStart);
+
         while (!CpuInterlockedCompareExchange(&g_UserDebuggerWaitingCommandCompleted, FALSE, FALSE))
         {
+            PlatformTimeQuerySystemTime(&Now);
+
+            if (Now.QuadPart - WaitStart.QuadPart > UD_COMMAND_COMPLETION_TIMEOUT &&
+                CpuInterlockedCompareExchange64((INT64 volatile *)&g_UserDebuggerWaitingCommandBuffer, 0, (INT64)ActionRequest) == (INT64)ActionRequest)
+            {
+                Result = FALSE;
+                break;
+            }
+
             PlatformTimeDelayExecution(1);
         }
+    }
+    else if (ActionRequest->WaitForEventCompletion)
+    {
+        //
+        // The command was not applied, don't leave its buffer behind
+        //
+        CpuInterlockedCompareExchange64((INT64 volatile *)&g_UserDebuggerWaitingCommandBuffer, 0, (INT64)ActionRequest);
     }
 
     //
