@@ -1154,6 +1154,13 @@ AttachingKillProcess(PDEBUGGER_ATTACH_DETACH_USER_MODE_PROCESS KillRequest)
     }
 
     //
+    // Stop intercepting its threads and unpause them first, as a detach does: a
+    // paused thread never leaves the kernel, so a terminated process could not
+    // exit, and a new process may get the same id
+    //
+    AttachingConfigureInterceptingThreads(ProcessDebuggingDetail->Token, FALSE);
+
+    //
     // Check if process exists or not
     //
     if (!CommonIsProcessExist(ProcessDebuggingDetail->ProcessId))
