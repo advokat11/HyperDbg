@@ -68,11 +68,6 @@ UdInitializeUserDebugger()
     ThreadHolderAllocateThreadHoldingBuffers();
 
     //
-    // Initialize command waiting event
-    //
-    SynchronizationInitializeEvent(&g_UserDebuggerWaitingCommandEvent);
-
-    //
     // Indicate that the user debugger is active
     //
     g_UserDebuggerState = TRUE;
@@ -386,9 +381,10 @@ UdReadRegisters(PROCESSOR_DEBUGGING_STATE * DbgState,
     ActionRequest->Result = DEBUGGER_OPERATION_WAS_SUCCESSFUL;
 
     //
-    // Set the event to indicate that the command is completed
+    // Indicate that the command is completed (we're in VMX root-mode, the
+    // waiting thread polls this flag)
     //
-    SynchronizationSetEvent(&g_UserDebuggerWaitingCommandEvent);
+    CpuInterlockedExchange(&g_UserDebuggerWaitingCommandCompleted, TRUE);
 }
 
 /**
@@ -464,9 +460,10 @@ UdRunScript(PROCESSOR_DEBUGGING_STATE * DbgState)
     ActionRequest->Result = DEBUGGER_OPERATION_WAS_SUCCESSFUL;
 
     //
-    // Set the event to indicate that the command is completed
+    // Indicate that the command is completed (we're in VMX root-mode, the
+    // waiting thread polls this flag)
     //
-    SynchronizationSetEvent(&g_UserDebuggerWaitingCommandEvent);
+    CpuInterlockedExchange(&g_UserDebuggerWaitingCommandCompleted, TRUE);
 }
 
 /**
@@ -680,6 +677,11 @@ UdDispatchUsermodeCommands(PDEBUGGER_UD_COMMAND_PACKET ActionRequest,
         // Set the output command buffer length
         //
         g_UserDebuggerWaitingCommandOutputBufferLength = ActionRequestOutputLength;
+
+        //
+        // The paused thread sets it once it has run the command
+        //
+        CpuInterlockedExchange(&g_UserDebuggerWaitingCommandCompleted, FALSE);
     }
 
     //
@@ -693,9 +695,16 @@ UdDispatchUsermodeCommands(PDEBUGGER_UD_COMMAND_PACKET ActionRequest,
     if (Result && ActionRequest->WaitForEventCompletion)
     {
         //
-        // Wait for the command to be completed
+        // Wait for the command to be completed. The paused thread runs it in VMX
+        // root-mode, so it can't signal an event: KeSetEvent there may switch to
+        // this thread from VMX root-mode, which then completes the IRP at
+        // DISPATCH_LEVEL and faults copying the result to the user buffer
+        // (bugcheck 0x50)
         //
-        SynchronizationWaitForEvent(&g_UserDebuggerWaitingCommandEvent);
+        while (!CpuInterlockedCompareExchange(&g_UserDebuggerWaitingCommandCompleted, FALSE, FALSE))
+        {
+            PlatformTimeDelayExecution(1);
+        }
     }
 
     //
