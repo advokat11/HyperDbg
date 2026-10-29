@@ -232,14 +232,15 @@ UdRegularStepOver(UINT64 LastRip, BOOLEAN IsNextInstructionACall, UINT32 CallLen
     {
         //
         // It's a call, we should put a hardware debug register breakpoint
-        // on the next instruction
+        // on the next instruction. The IOCTL thread has already set it on all
+        // cores (UdDispatchUsermodeCommands): this runs in VMX root-mode, where
+        // a DPC broadcast may switch to another thread on the VMM stack, which
+        // then resumes in non-root mode and executes VMRESUME (bugcheck 0x1AA).
+        // Setting it here again only covers the core the thread continues on
         //
         NextAddressForHardwareDebugBp = LastRip + CallLength;
 
-        //
-        // Broadcast to apply hardware debug registers to all cores
-        //
-        UdBroadcastSetHardwareDebugRegistersAllCores((PVOID)NextAddressForHardwareDebugBp);
+        UdApplyHardwareDebugRegister((PVOID)NextAddressForHardwareDebugBp);
     }
     else
     {
@@ -680,6 +681,51 @@ UdCheckForCommand(PROCESSOR_DEBUGGING_STATE *         DbgState,
 }
 
 /**
+ * @brief Set the hardware breakpoint of a step over a call on all cores
+ * @details Called from the IOCTL thread, not in VMX root-mode, since the
+ * broadcast uses DPCs
+ *
+ * @param ProcessDebuggingDetails
+ * @param ActionRequest
+ *
+ * @return VOID
+ */
+static VOID
+UdPrepareStepOverACall(PUSERMODE_DEBUGGING_PROCESS_DETAILS ProcessDebuggingDetails,
+                       PDEBUGGER_UD_COMMAND_PACKET         ActionRequest)
+{
+    PUSERMODE_DEBUGGING_THREAD_DETAILS ThreadDebuggingDetails;
+    DEBUGGER_REMOTE_STEPPING_REQUEST   SteppingType;
+
+    if (ActionRequest->UdAction.ActionType != DEBUGGER_UD_COMMAND_ACTION_TYPE_REGULAR_STEP ||
+        ActionRequest->ApplyToAllPausedThreads ||
+        !(BOOLEAN)ActionRequest->UdAction.OptionalParam2)
+    {
+        return;
+    }
+
+    SteppingType = (DEBUGGER_REMOTE_STEPPING_REQUEST)ActionRequest->UdAction.OptionalParam1;
+
+    if (SteppingType != DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER &&
+        SteppingType != DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER_FOR_GU &&
+        SteppingType != DEBUGGER_REMOTE_STEPPING_REQUEST_STEP_OVER_FOR_GU_LAST_INSTRUCTION)
+    {
+        return;
+    }
+
+    ThreadDebuggingDetails = ThreadHolderGetProcessThreadDetailsByProcessIdAndThreadId(ProcessDebuggingDetails->ProcessId,
+                                                                                       ActionRequest->TargetThreadId);
+
+    if (!ThreadDebuggingDetails || !ThreadDebuggingDetails->IsPaused)
+    {
+        return;
+    }
+
+    UdBroadcastSetHardwareDebugRegistersAllCores((PVOID)(ThreadDebuggingDetails->ThreadRip +
+                                                         (UINT32)ActionRequest->UdAction.OptionalParam3));
+}
+
+/**
  * @brief Dispatch the user-mode commands
  *
  * @param ActionRequest
@@ -738,6 +784,12 @@ UdDispatchUsermodeCommands(PDEBUGGER_UD_COMMAND_PACKET ActionRequest,
         //
         CpuInterlockedExchange(&g_UserDebuggerWaitingCommandCompleted, FALSE);
     }
+
+    //
+    // A step over a call breaks on the instruction after it on whichever core
+    // the thread returns, so set it on all cores before the step runs
+    //
+    UdPrepareStepOverACall(ProcessDebuggingDetails, ActionRequest);
 
     //
     // Apply the command to all threads or just one thread
