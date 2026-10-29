@@ -17,6 +17,7 @@
 extern UINT32                   g_ProcessIdOfLatestStartingProcess;
 extern ACTIVE_DEBUGGING_PROCESS g_ActiveProcessDebuggingState;
 extern BOOLEAN                  g_IsUserDebuggerInitialized;
+extern BOOLEAN                  g_IsInstrumentingInstructions;
 extern BOOLEAN                  g_IsVmmModuleLoaded;
 extern UINT64                   g_ResultOfEvaluatedExpression;
 extern UINT32                   g_ErrorStateOfResultOfEvaluatedExpression;
@@ -1244,6 +1245,90 @@ UdSendScriptBufferToProcess(UINT64  ProcessDetailToken,
 }
 
 /**
+ * @brief Whether the process attached by the user debugger is still running
+ *
+ * @return BOOLEAN
+ */
+static BOOLEAN
+UdIsDebuggeeProcessAlive()
+{
+    BOOLEAN IsAlive       = FALSE;
+    HANDLE  ProcessHandle = NULL;
+    DWORD   ExitCode      = 0;
+
+    if (!g_ActiveProcessDebuggingState.IsActive || g_ActiveProcessDebuggingState.ProcessId == 0)
+    {
+        return FALSE;
+    }
+
+    ProcessHandle = PlatformOpenProcess(PROCESS_QUERY_INFORMATION,
+                                        FALSE,
+                                        g_ActiveProcessDebuggingState.ProcessId);
+
+    if (ProcessHandle == NULL)
+    {
+        return FALSE;
+    }
+
+    //
+    // A terminated process keeps a handle open, so the exit code is what tells
+    // the two apart (259 = STILL_ACTIVE)
+    //
+    if (PlatformGetExitCodeProcess(ProcessHandle, &ExitCode) && ExitCode == 259)
+    {
+        IsAlive = TRUE;
+    }
+
+    PlatformCloseHandle(ProcessHandle);
+
+    return IsAlive;
+}
+
+/**
+ * @brief Wait until the debuggee halts, giving up if the process is gone
+ *
+ * @details The debugger gets no notification when an attached process exits, so
+ * a step whose thread dies mid-flight would wait for a pause packet that can
+ * never come - forever, holding the caller (and, in an MCP server, the session)
+ *
+ * @return BOOLEAN TRUE if the debuggee halted, FALSE if it is not alive anymore
+ */
+BOOLEAN
+UdWaitForDebuggeeToHalt()
+{
+    DEBUGGER_SYNCRONIZATION_EVENTS_STATE * SyncronizationObject =
+        &g_UserSyncronizationObjectsHandleTable
+            [DEBUGGER_SYNCRONIZATION_OBJECT_USER_DEBUGGER_IS_DEBUGGER_RUNNING];
+
+    SyncronizationObject->IsOnWaitingState = TRUE;
+
+    while (TRUE)
+    {
+        if (PlatformWaitForSingleObject(SyncronizationObject->EventHandle, 100) == WAIT_OBJECT_0)
+        {
+            return TRUE;
+        }
+
+        if (!UdIsDebuggeeProcessAlive())
+        {
+            SyncronizationObject->IsOnWaitingState = FALSE;
+
+            ShowMessages("err, the debuggee process is not alive anymore (it exited or "
+                         "crashed), so this step cannot finish\n");
+
+            //
+            // 'gu' loops until this flag is cleared (its CTRL+C handler does the
+            // same), and the halted thread a user-debugger command needs is gone
+            //
+            g_IsInstrumentingInstructions               = FALSE;
+            g_ActiveProcessDebuggingState.IsActive      = FALSE;
+
+            return FALSE;
+        }
+    }
+}
+
+/**
  * @brief Send stepping instructions packet to user debugger
  * @param ProcessDetailToken
  * @param TargetThreadId
@@ -1305,9 +1390,7 @@ UdSendStepPacketToDebuggee(UINT64                           ProcessDetailToken,
         //
         // Wait until the result of user-input received
         //
-        DbgWaitForUserResponse(DEBUGGER_SYNCRONIZATION_OBJECT_USER_DEBUGGER_IS_DEBUGGER_RUNNING);
-
-        return TRUE;
+        return UdWaitForDebuggeeToHalt();
     }
 
     //
