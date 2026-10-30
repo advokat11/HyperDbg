@@ -11,6 +11,12 @@
  */
 #include "pch.h"
 
+//
+// The address of the breakpoint set on all cores for a step over a call, until
+// it is removed
+//
+static volatile UINT64 g_UdStepOverBreakpointAddress = NULL64_ZERO;
+
 /**
  * @brief initialize user debugger
  * @details this function should be called on vmx non-root
@@ -140,9 +146,13 @@ UdHandleInstantBreak(PROCESSOR_DEBUGGING_STATE *         DbgState,
     }
 
     //
-    // Add the process to the watching list to be able to intercept the threads
+    // Add the process to the watching list to be able to intercept the threads.
+    // It may be there already (e.g., a breakpoint that is a fault triggers again
+    // on the paused thread, or two threads break at once): refusing it then
+    // re-injected the event into the debuggee (a single-step exception)
     //
-    if (AttachingConfigureInterceptingThreads(ProcessDebuggingDetail->Token, TRUE))
+    if (ProcessDebuggingDetail->IsOnThreadInterceptingPhase ||
+        AttachingConfigureInterceptingThreads(ProcessDebuggingDetail->Token, TRUE))
     {
         //
         // Since the adding it to the watching list will take effect from the next
@@ -174,6 +184,15 @@ UdHandleInstantBreak(PROCESSOR_DEBUGGING_STATE *         DbgState,
 VOID
 UdApplyHardwareDebugRegister(PVOID TargetAddress)
 {
+    if (TargetAddress == NULL)
+    {
+        //
+        // Remove it (DR7 reset value)
+        //
+        CpuWriteDr(7, 0x400);
+        return;
+    }
+
     SetDebugRegisters(DEBUGGER_DEBUG_REGISTER_FOR_STEP_OVER,
                       BREAK_ON_INSTRUCTION_FETCH,
                       FALSE,
@@ -209,6 +228,26 @@ UdBroadcastSetHardwareDebugRegistersAllCores(PVOID TargetAddress)
 }
 
 /**
+ * @brief Remove the breakpoint of a step over a call from all cores
+ * @details this function should not be called in vmx-root. The breakpoint is
+ * one-shot: left set, the next time any thread runs that instruction it breaks
+ *
+ * @return VOID
+ */
+VOID
+UdDisarmStepOverBreakpoint()
+{
+    if (g_UdStepOverBreakpointAddress == NULL64_ZERO)
+    {
+        return;
+    }
+
+    g_UdStepOverBreakpointAddress = NULL64_ZERO;
+
+    UdBroadcastSetHardwareDebugRegistersAllCores(NULL);
+}
+
+/**
  * @brief Regular step-over, step one instruction to the debuggee on user debugger if
  * there is a call then it jumps the call
  *
@@ -240,7 +279,14 @@ UdRegularStepOver(UINT64 LastRip, BOOLEAN IsNextInstructionACall, UINT32 CallLen
         //
         NextAddressForHardwareDebugBp = LastRip + CallLength;
 
-        UdApplyHardwareDebugRegister((PVOID)NextAddressForHardwareDebugBp);
+        //
+        // In VMX root-mode, the guest's DR7 is in the VMCS (the broadcast turned
+        // on the save and load debug controls)
+        //
+        SetDebugRegisters(DEBUGGER_DEBUG_REGISTER_FOR_STEP_OVER,
+                          BREAK_ON_INSTRUCTION_FETCH,
+                          VmFuncCheckCpuSupportForSaveAndLoadDebugControls(),
+                          NextAddressForHardwareDebugBp);
     }
     else
     {
@@ -264,6 +310,18 @@ UdHandleDebugEventsWhenUserDebuggerIsAttached(PROCESSOR_DEBUGGING_STATE * DbgSta
                                               BOOLEAN                     TrapSetByDebugger)
 {
     UNREFERENCED_PARAMETER(TrapSetByDebugger);
+
+    //
+    // The breakpoint of a step over a call is a fault: as long as it is set,
+    // the paused thread triggers it again on every VM-entry. Remove it from
+    // this core (the IOCTL thread removes it from the others)
+    //
+    if (g_UdStepOverBreakpointAddress != NULL64_ZERO &&
+        VmFuncGetLastVmexitRip(DbgState->CoreId) == g_UdStepOverBreakpointAddress &&
+        VmFuncCheckCpuSupportForSaveAndLoadDebugControls())
+    {
+        VmFuncSetDebugReg7(0x400);
+    }
 
     if (UdHandleInstantBreak(DbgState,
                              DEBUGGEE_PAUSING_REASON_DEBUGGEE_GENERAL_DEBUG_BREAK,
@@ -721,8 +779,9 @@ UdPrepareStepOverACall(PUSERMODE_DEBUGGING_PROCESS_DETAILS ProcessDebuggingDetai
         return;
     }
 
-    UdBroadcastSetHardwareDebugRegistersAllCores((PVOID)(ThreadDebuggingDetails->ThreadRip +
-                                                         (UINT32)ActionRequest->UdAction.OptionalParam3));
+    g_UdStepOverBreakpointAddress = ThreadDebuggingDetails->ThreadRip + (UINT32)ActionRequest->UdAction.OptionalParam3;
+
+    UdBroadcastSetHardwareDebugRegistersAllCores((PVOID)g_UdStepOverBreakpointAddress);
 }
 
 /**
@@ -787,8 +846,10 @@ UdDispatchUsermodeCommands(PDEBUGGER_UD_COMMAND_PACKET ActionRequest,
 
     //
     // A step over a call breaks on the instruction after it on whichever core
-    // the thread returns, so set it on all cores before the step runs
+    // the thread returns, so set it on all cores before the step runs (and
+    // remove the one of the previous step first)
     //
+    UdDisarmStepOverBreakpoint();
     UdPrepareStepOverACall(ProcessDebuggingDetails, ActionRequest);
 
     //
